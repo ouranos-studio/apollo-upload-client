@@ -1,6 +1,4 @@
-'use strict'
-
-const { ApolloLink, Observable } = require('apollo-link')
+const { ApolloLink, Observable, fromError } = require('apollo-link')
 const {
   selectURI,
   selectHttpOptionsAndBody,
@@ -9,14 +7,79 @@ const {
   createSignalIfSupported,
   parseAndCheckHttpResponse
 } = require('apollo-link-http-common')
-const {
-  extractFiles,
-  isExtractableFile,
-  ReactNativeFile
-} = require('extract-files')
+const { extractFiles, ReactNativeFile } = require('extract-files')
 
 /**
- * A React Native [`File`](https://developer.mozilla.org/en-US/docs/Web/API/File)
+ * Converts a given GraphQL POST request URI and body into a GET request URI
+ * with query string parameters. The given URI must be well-formed and can’t
+ * contain conflicting query parameters. The standard URL API is avoided as
+ * browser support is not universal.
+ * @kind function
+ * @name rewriteURIForGET
+ * @see [`apollo-link-http` implementation](https://github.com/apollographql/apollo-link/blob/c6f0cf7f3a02bf34587c9660387ca8a4b16d4bb8/packages/apollo-link-http/src/httpLink.ts#L198).
+ * @param {string} chosenURI POST request URI.
+ * @param {object} body POST request body.
+ * @returns {{newURI: string}|{parseError: object}} GET request URI, or a parse error.
+ * @ignore
+ */
+function rewriteURIForGET(chosenURI, body) {
+  const queryParams = []
+  const addQueryParam = (key, value) => {
+    queryParams.push(`${key}=${encodeURIComponent(value)}`)
+  }
+
+  if ('query' in body) addQueryParam('query', body.query)
+
+  if (body.operationName) addQueryParam('operationName', body.operationName)
+
+  if (body.variables) {
+    let serializedVariables
+
+    try {
+      serializedVariables = serializeFetchParameter(
+        body.variables,
+        'Variables map'
+      )
+    } catch (parseError) {
+      return { parseError }
+    }
+
+    addQueryParam('variables', serializedVariables)
+  }
+
+  if (body.extensions) {
+    let serializedExtensions
+
+    try {
+      serializedExtensions = serializeFetchParameter(
+        body.extensions,
+        'Extensions map'
+      )
+    } catch (parseError) {
+      return { parseError }
+    }
+
+    addQueryParam('extensions', serializedExtensions)
+  }
+
+  let fragment = ''
+  let preFragment = chosenURI
+
+  const fragmentStart = chosenURI.indexOf('#')
+  if (fragmentStart !== -1) {
+    fragment = chosenURI.substr(fragmentStart)
+    preFragment = chosenURI.substr(0, fragmentStart)
+  }
+
+  const queryParamsPrefix = preFragment.indexOf('?') === -1 ? '?' : '&'
+
+  return {
+    newURI: preFragment + queryParamsPrefix + queryParams.join('&') + fragment
+  }
+}
+
+/**
+ * A React Native [`File`](https://developer.mozilla.org/docs/web/api/file)
  * substitute.
  *
  * Be aware that inspecting network requests with Chrome dev tools interferes
@@ -24,7 +87,7 @@ const {
  * @kind typedef
  * @name ReactNativeFileSubstitute
  * @type {object}
- * @see [`extract-files` `ReactNativeFileSubstitute` docs](https://github.com/jaydenseric/extract-files#type-reactnativefilesubstitute).
+ * @see [`extract-files` docs](https://github.com/jaydenseric/extract-files#type-reactnativefilesubstitute).
  * @see [React Native `FormData` polyfill source](https://github.com/facebook/react-native/blob/v0.45.1/Libraries/Network/FormData.js#L34).
  * @prop {string} uri Filesystem path.
  * @prop {string} [name] File name.
@@ -40,13 +103,14 @@ const {
  */
 
 /**
- * Used to mark [React Native `File` substitutes]{@link ReactNativeFileSubstitute}
- * as it’s too risky to assume all objects with `uri`, `type` and `name`
- * properties are extractable files.
+ * Used to mark a
+ * [React Native `File` substitute]{@link ReactNativeFileSubstitute}.
+ * It’s too risky to assume all objects with `uri`, `type` and `name` properties
+ * are files to extract. Re-exported from [`extract-files`](https://npm.im/extract-files)
+ * for convenience.
  * @kind class
  * @name ReactNativeFile
- * @param {ReactNativeFileSubstitute} file A React Native [`File`](https://developer.mozilla.org/en-US/docs/Web/API/File) substitute.
- * @see [`extract-files` `ReactNativeFile` docs](https://github.com/jaydenseric/extract-files#class-reactnativefile).
+ * @param {ReactNativeFileSubstitute} file A React Native [`File`](https://developer.mozilla.org/docs/web/api/file) substitute.
  * @example <caption>A React Native file that can be used in query or mutation variables.</caption>
  * ```js
  * const { ReactNativeFile } = require('apollo-upload-client')
@@ -71,89 +135,16 @@ exports.ReactNativeFile = ReactNativeFile
  */
 
 /**
- * A function that checks if a value is an extractable file.
- * @kind typedef
- * @name ExtractableFileMatcher
- * @type {Function}
- * @param {*} value Value to check.
- * @returns {boolean} Is the value an extractable file.
- * @see [`isExtractableFile`]{@link isExtractableFile} has this type.
- * @example <caption>How to check for the default exactable files, as well as a custom type of file.</caption>
- * ```js
- * const { isExtractableFile } = require('apollo-upload-client')
- *
- * const isExtractableFileEnhanced = value =>
- *   isExtractableFile(value) ||
- *   (typeof CustomFile !== 'undefined' && value instanceof CustomFile)
- * ```
- */
-
-/**
- * The default implementation for [`createUploadLink`]{@link createUploadLink}
- * `options.isExtractableFile`.
- * @kind function
- * @name isExtractableFile
- * @type {ExtractableFileMatcher}
- * @param {*} value Value to check.
- * @returns {boolean} Is the value an extractable file.
- * @see [`extract-files` `isExtractableFile` docs](https://github.com/jaydenseric/extract-files#function-isextractablefile).
- */
-exports.isExtractableFile = isExtractableFile
-
-/**
- * Appends a file extracted from the GraphQL operation to the
- * [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData)
- * instance used as the [`fetch`](https://developer.mozilla.org/en-US/docs/Web/API/WindowOrWorkerGlobalScope/fetch)
- * `options.body` for the [GraphQL multipart request](https://github.com/jaydenseric/graphql-multipart-request-spec).
- * @kind typedef
- * @name FormDataFileAppender
- * @param {FormData} formData [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) instance to append the specified file to.
- * @param {string} fieldName Field name for the file.
- * @param {*} file File to append. The file type depends on what the [`ExtractableFileMatcher`]{@link ExtractableFileMatcher} extracts.
- * @see [`formDataAppendFile`]{@link formDataAppendFile} has this type.
- * @see [`createUploadLink`]{@link createUploadLink} accepts this type in `options.formDataAppendFile`.
- */
-
-/**
- * The default implementation for [`createUploadLink`]{@link createUploadLink}
- * `options.formDataAppendFile` that uses the standard
- * [`FormData.append`](https://developer.mozilla.org/en-US/docs/Web/API/FormData/append)
- * method.
- * @kind function
- * @name formDataAppendFile
- * @type {FormDataFileAppender}
- * @param {FormData} formData [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) instance to append the specified file to.
- * @param {string} fieldName Field name for the file.
- * @param {*} file File to append.
- */
-function formDataAppendFile(formData, fieldName, file) {
-  formData.append(fieldName, file, file.name)
-}
-
-exports.formDataAppendFile = formDataAppendFile
-
-/**
  * Creates a terminating [Apollo Link](https://apollographql.com/docs/link)
- * capable of file uploads.
- *
- * The link matches and extracts files in the GraphQL operation. If there are
- * files it uses a [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData)
- * instance as the [`fetch`](https://developer.mozilla.org/en-US/docs/Web/API/WindowOrWorkerGlobalScope/fetch)
- * `options.body` to make a [GraphQL multipart request](https://github.com/jaydenseric/graphql-multipart-request-spec),
- * otherwise it sends a regular POST request.
- *
- * Some of the options are similar to the [`createHttpLink` options](https://apollographql.com/docs/link/links/http/#options).
+ * capable of file uploads. Options match [`createHttpLink`](https://apollographql.com/docs/link/links/http#options).
  * @see [GraphQL multipart request spec](https://github.com/jaydenseric/graphql-multipart-request-spec).
- * @see [`apollo-link` on GitHub](https://github.com/apollographql/apollo-link).
+ * @see [apollo-link on GitHub](https://github.com/apollographql/apollo-link).
  * @kind function
  * @name createUploadLink
  * @param {object} options Options.
  * @param {string} [options.uri=/graphql] GraphQL endpoint URI.
- * @param {ExtractableFileMatcher} [options.isExtractableFile=isExtractableFile] Customizes how files are matched in the GraphQL operation for extraction.
- * @param {class} [options.FormData] [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) implementation to use, defaulting to the [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) global.
- * @param {FormDataFileAppender} [options.formDataAppendFile=formDataAppendFile] Customizes how extracted files are appended to the [`FormData`](https://developer.mozilla.org/en-US/docs/Web/API/FormData) instance.
- * @param {Function} [options.fetch] [`fetch`](https://fetch.spec.whatwg.org) implementation to use, defaulting to the [`fetch`](https://developer.mozilla.org/en-US/docs/Web/API/WindowOrWorkerGlobalScope/fetch) global.
- * @param {FetchOptions} [options.fetchOptions] [`fetch` options]{@link FetchOptions}; overridden by upload requirements.
+ * @param {Function} [options.fetch] [`fetch`](https://fetch.spec.whatwg.org) implementation to use, defaulting to the `fetch` global.
+ * @param {FetchOptions} [options.fetchOptions] `fetch` options; overridden by upload requirements.
  * @param {string} [options.credentials] Overrides `options.fetchOptions.credentials`.
  * @param {object} [options.headers] Merges with and overrides `options.fetchOptions.headers`.
  * @param {boolean} [options.includeExtensions=false] Toggles sending `extensions` fields to the GraphQL server.
@@ -172,10 +163,7 @@ exports.formDataAppendFile = formDataAppendFile
  */
 exports.createUploadLink = ({
   uri: fetchUri = '/graphql',
-  isExtractableFile: customIsExtractableFile = isExtractableFile,
-  FormData: CustomFormData = FormData,
-  formDataAppendFile: customFormDataAppendFile = formDataAppendFile,
-  fetch: customFetch = fetch,
+  fetch: linkFetch = fetch,
   fetchOptions,
   credentials,
   headers,
@@ -189,11 +177,11 @@ exports.createUploadLink = ({
   }
 
   return new ApolloLink(operation => {
-    const uri = selectURI(operation, fetchUri)
+    let uri = selectURI(operation, fetchUri)
     const context = operation.getContext()
 
-    // Apollo Graph Manager client awareness:
-    // https://apollographql.com/docs/graph-manager/client-awareness
+    // Apollo Engine client awareness:
+    // https://apollographql.com/docs/platform/client-awareness
 
     const {
       // From Apollo Client config.
@@ -220,7 +208,7 @@ exports.createUploadLink = ({
       contextConfig
     )
 
-    const { clone, files } = extractFiles(body, '', customIsExtractableFile)
+    const { clone, files } = extractFiles(body)
     const payload = serializeFetchParameter(clone, 'Payload')
 
     if (files.size) {
@@ -230,7 +218,7 @@ exports.createUploadLink = ({
       // GraphQL multipart request spec:
       // https://github.com/jaydenseric/graphql-multipart-request-spec
 
-      const form = new CustomFormData()
+      const form = new FormData()
 
       form.append('operations', payload)
 
@@ -243,11 +231,18 @@ exports.createUploadLink = ({
 
       i = 0
       files.forEach((paths, file) => {
-        customFormDataAppendFile(form, ++i, file)
+        form.append(++i, file, file.name)
       })
 
       options.body = form
-    } else options.body = payload
+    } else {
+      const method = options.method.toUpperCase()
+      if (method === 'GET') {
+        const { newURI, parseError } = rewriteURIForGET(uri, body)
+        if (parseError) return fromError(parseError)
+        uri = newURI
+      } else options.body = payload
+    }
 
     return new Observable(observer => {
       // If no abort controller signal was provided in fetch options, and the
@@ -262,7 +257,7 @@ exports.createUploadLink = ({
         }
       }
 
-      customFetch(uri, options)
+      linkFetch(uri, options)
         .then(response => {
           // Forward the response on the context.
           operation.setContext({ response })
